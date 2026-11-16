@@ -1,0 +1,1 @@
+ALTER TABLE unified_tokens ADD COLUMN IF NOT EXISTS name VARCHAR(255);

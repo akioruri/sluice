@@ -1,0 +1,38 @@
+[package]
+name = "sluice-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sluice-server"
+path = "src/main.rs"
+
+[dependencies]
+sluice-core = { path = "../../crates/sluice-core" }
+tokio.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+tower-http.workspace = true
+reqwest.workspace = true
+sqlx = { workspace = true }
+sqlx-macros = "0.8"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+sha2.workspace = true
+futures-util.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio-test.workspace = true
+bytes.workspace = true

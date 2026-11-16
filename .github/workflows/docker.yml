@@ -1,0 +1,204 @@
+name: Docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+# A new push supersedes the build still running for the same ref: the registry
+# only ever needs the newest image, so older runs are pure waste.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per architecture. Cross-compiling the Rust server
+          # under QEMU instead multiplies the build time, so each arch gets a
+          # machine of its own. Remove the arm64 entry to ship amd64 only — it
+          # needs an arm runner, which is free on public repos and billed on
+          # private ones.
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each architecture pushes under its own suffix (`...:v1.2.3-amd64`) so the
+      # merge job below can stitch them into one manifest list.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+            suffix=-${{ matrix.arch }},onlatest=true
+          # Every tag push is a release, so `latest` always tracks it.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest
+
+      # `load: true` puts the image in the runner's Docker daemon so the smoke
+      # test below can run it without pulling anything back from the registry.
+      # Each arch is built on its own machine, so the test exercises the real
+      # binary for that architecture rather than an emulated one.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/${{ matrix.arch }}
+          # One cache scope per architecture, otherwise the two builds evict
+          # each other's layers.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          # Per-arch images are plain single-platform images: attestation
+          # manifests would only add unknown/unknown entries that older Docker
+          # clients cannot pull, and the merge job composes the manifest list.
+          provenance: false
+          sbom: false
+
+      - name: Smoke test
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          # Every tag metadata-action produced was loaded into the local daemon
+          # and they all point at the image just built, so take the first one
+          # rather than guessing which tag name is set for this ref.
+          image="$(docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE_NAME" | head -n 1)"
+          test -n "$image"
+          echo "testing $image"
+
+          # No DATABASE_URL: the server starts anyway and refuses to proxy,
+          # which is enough to prove the binary and the bundled frontend run.
+          master_key="$(openssl rand -base64 32)"
+
+          docker run -d --name sluice-smoke \
+            -e SLUICE_BIND_ADDR=0.0.0.0:8080 \
+            -e SLUICE_MASTER_KEY="$master_key" \
+            -e SLUICE_ADMIN_PASSWORD=smoke-test \
+            "$image"
+
+          # Print the server log and drop the container whatever happens: the
+          # log is the only clue when the checks below never turn green.
+          trap '{ echo "== container logs =="; docker logs sluice-smoke 2>&1 || true; docker rm -f sluice-smoke >/dev/null 2>&1 || true; }' EXIT
+
+          ready=""
+          for _ in $(seq 1 30); do
+            if docker exec sluice-smoke curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null | grep -qx ok; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "the server never answered /healthz" >&2
+            exit 1
+          fi
+          echo "/healthz -> $(docker exec sluice-smoke curl -fsS http://127.0.0.1:8080/healthz)"
+
+          status=""
+          if ! status="$(docker exec sluice-smoke curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)"; then
+            echo "GET / failed" >&2
+            exit 1
+          fi
+          echo "/ -> $status"
+          test "$status" = "200"
+
+  # The per-arch tags are only useful once a single tag resolves to whichever
+  # architecture the client is running, so they are folded into one manifest
+  # list per tag.
+  merge:
+    name: Merge manifests
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same tag rules as the build job, minus the architecture suffix, so the
+      # names line up exactly.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          # Same tag rules as the build job, minus the architecture suffix, so the
+          # names line up exactly.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest
+
+      # metadata-action prints one tag per line. It has to travel through an
+      # environment variable: substituting it inline would drop raw newlines
+      # into the `for` statement, which bash rejects with a syntax error.
+      - name: Create the multi-arch manifests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TAGS" ]; then
+            echo "metadata-action produced no tags to merge" >&2
+            exit 1
+          fi
+
+          # Unquoted on purpose: word splitting turns the newlines back into a
+          # list. Tag names never contain whitespace, so this is safe.
+          for tag in $TAGS; do
+            echo ">> $tag"
+            docker buildx imagetools create \
+              -t "$tag" \
+              "$tag-amd64" \
+              "$tag-arm64"
+            docker buildx imagetools inspect "$tag"
+          done

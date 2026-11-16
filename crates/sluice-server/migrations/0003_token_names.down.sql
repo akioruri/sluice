@@ -1,0 +1,1 @@
+ALTER TABLE unified_tokens DROP COLUMN IF EXISTS name;

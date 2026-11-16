@@ -1,0 +1,15 @@
+# Build artifacts
+target/
+frontend/build/
+frontend/.svelte-kit/
+frontend/dist/
+
+# Dependencies
+frontend/node_modules/
+
+# VCS / IDE / OS
+.git/
+.DS_Store
+
+# Docs
+*.md

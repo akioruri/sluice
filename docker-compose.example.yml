@@ -1,0 +1,26 @@
+services:
+  sluice:
+    image: ghcr.io/akioruri/sluice:latest
+    ports:
+      # Loopback only: this gateway holds vendor credentials, so it should not be
+      # reachable from outside the host without a TLS-terminating proxy in front.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Must be 0.0.0.0 inside a container: the default 127.0.0.1 only listens on
+      # the container's own loopback and is unreachable from the host.
+      - SLUICE_BIND_ADDR=0.0.0.0:8080
+      # Bring your own PostgreSQL. This file deliberately does not ship one, so
+      # point this at a database you operate yourself.
+      #
+      # `host.docker.internal` resolves to the host on Docker Desktop (macOS and
+      # Windows). On Linux add to this service:
+      #   extra_hosts: ["host.docker.internal:host-gateway"]
+      #
+      # Without a reachable database the server still starts, but it refuses to
+      # proxy: there is no token store to validate a client's credential against.
+      - DATABASE_URL=postgres://sluice:sluice@host.docker.internal:5432/sluice
+      # 32 bytes, base64-encoded. Generate your own and keep it safe:
+      #   openssl rand -base64 32
+      # Losing it makes every stored vendor key undecryptable.
+      - SLUICE_MASTER_KEY=REPLACE_WITH_openssl_rand_base64_32_OUTPUT
+      - SLUICE_ADMIN_PASSWORD=change-me
